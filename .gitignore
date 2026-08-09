@@ -1,3 +1,4 @@
 *.log
 data/analysis/_*.json
 data/analysis/_*.jsonl
+data/analysis/CHAINWIDE_POOL_CENSUS.csv

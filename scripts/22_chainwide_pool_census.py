@@ -39,6 +39,20 @@ def rpc(m, p, tries=5):
     raise last
 
 
+def get_logs_adaptive(lo, hi, depth=0):
+    """eth_getLogs, halving the range when the node's 10,000-log cap is hit.
+    Pool creation density rises sharply in recent blocks, so a fixed chunk size
+    that works early in the chain fails near the head."""
+    try:
+        return rpc("eth_getLogs", [{"address": PM, "fromBlock": hex(lo),
+                                    "toBlock": hex(hi), "topics": [INIT]}], tries=2)
+    except Exception as e:
+        if "exceeds limit" not in str(e) or lo >= hi or depth > 12:
+            raise
+        mid = (lo + hi) // 2
+        return get_logs_adaptive(lo, mid, depth + 1) + get_logs_adaptive(mid + 1, hi, depth + 1)
+
+
 def i24(w):
     v = int(w, 16) & 0xFFFFFF
     return v - 0x1000000 if v & 0x800000 else v
@@ -61,8 +75,7 @@ with open(CACHE, "a") as out:
     s = start
     while s <= latest:
         e = min(s + CHUNK - 1, latest)
-        lg = rpc("eth_getLogs", [{"address": PM, "fromBlock": hex(s), "toBlock": hex(e),
-                                  "topics": [INIT]}])
+        lg = get_logs_adaptive(s, e)
         for L in lg:
             b = int(L["blockNumber"], 16)
             if b <= done_to:

@@ -53,22 +53,36 @@ def rpc(m, p, tries=4):
     raise last
 
 
-def batch(calls, tries=4):
-    """calls = [(id, to, data)] -> {id: result}"""
+BATCH_MAX = 50          # the node returns 429 on batches of >=100
+
+
+def batch(calls, tries=5):
+    """calls = [(id, to, data)] -> {id: result}. Raises if a batch never lands,
+    rather than returning {} -- a silent empty result previously produced a
+    complete run in which every PoolKey resolved to None."""
+    if len(calls) > BATCH_MAX:
+        out = {}
+        for i in range(0, len(calls), BATCH_MAX):
+            out.update(batch(calls[i:i + BATCH_MAX], tries))
+        return out
     payload = [{"jsonrpc": "2.0", "id": i, "method": "eth_call",
                 "params": [{"to": to, "data": data}, "latest"]} for i, to, data in calls]
+    last = ""
     for a in range(tries):
         try:
             out = subprocess.run(["curl", "-sS", "--max-time", "90", RPC,
                                   "-H", "Content-Type: application/json", "-d", json.dumps(payload)],
                                  capture_output=True, text=True, check=True).stdout
             r = json.loads(out)
-            if isinstance(r, list):
-                return {x["id"]: x.get("result") for x in r if "result" in x}
-        except Exception:
-            pass
-        time.sleep(1.0 * (a + 1))
-    return {}
+            if isinstance(r, list) and r:
+                got = {x["id"]: x.get("result") for x in r if "result" in x}
+                if got:
+                    return got
+            last = str(out)[:160]
+        except Exception as e:
+            last = str(e)[:160]
+        time.sleep(1.5 * (a + 1))
+    raise RuntimeError(f"batch of {len(calls)} failed after {tries} attempts: {last}")
 
 
 def pool_id(c0, c1, fee, ts, hooks):
@@ -117,14 +131,16 @@ if os.path.exists(RCACHE):
     print(f"loaded cached resolution for {len(info)} positions")
 else:
     info, liqv = {}, {}
-B = 200
+B = 50
 todo_ids = [t for t in ids if t not in info]
 for i in range(0, len(todo_ids), B):
     chunk = todo_ids[i:i + B]
     r1 = batch([(t, POSM, PI + f"{t:064x}") for t in chunk])
     r2 = batch([(t, POSM, PL + f"{t:064x}") for t in chunk])
     info.update(r1); liqv.update(r2)
-    print(f"  {min(i+B, len(todo_ids))}/{len(todo_ids)}")
+    time.sleep(0.2)
+    if (i // B) % 10 == 0 or i + B >= len(todo_ids):
+        print(f"  {min(i+B, len(todo_ids))}/{len(todo_ids)}")
 if todo_ids:
     json.dump({"info": {str(k): v for k, v in info.items()},
                "liq": {str(k): v for k, v in liqv.items()}}, open(RCACHE, "w"))
@@ -149,6 +165,11 @@ def parse_key(res):
 
 
 keys = {t: parse_key(info.get(t)) for t in ids}
+resolved = sum(1 for v in keys.values() if v)
+print(f"resolved PoolKeys: {resolved}/{len(ids)}")
+if resolved < len(ids) * 0.99:
+    raise SystemExit(f"ABORT: only {resolved}/{len(ids)} PoolKeys resolved -- "
+                     "refusing to report a footprint built on failed calls")
 WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
 USDG_A = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
 NATIVE_A = "0x0000000000000000000000000000000000000000"

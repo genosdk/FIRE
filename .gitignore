@@ -1,1 +1,3 @@
 *.log
+data/analysis/_*.json
+data/analysis/_*.jsonl

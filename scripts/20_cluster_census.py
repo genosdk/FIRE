@@ -94,11 +94,14 @@ else:
             tid = int(L["topics"][3], 16)
             frm = ("0x" + L["topics"][1][26:]).lower()
             k = str(tid)
-            if k not in recs or int(L["blockNumber"], 16) < recs[k]["block"]:
-                recs[k] = {"token_id": tid, "owner": a, "cohort": COHORT[a],
-                           "block": int(L["blockNumber"], 16), "tx": L["transactionHash"],
-                           "minted": frm == "0x" + "00" * 20}
+            ev = {"block": int(L["blockNumber"], 16), "from": frm, "to": a,
+                  "tx": L["transactionHash"]}
+            if k not in recs:
+                recs[k] = {"token_id": tid, "events": []}
+            recs[k]["events"].append(ev)
         print(f"  {a} {COHORT[a]:9} {len(lg)} transfers in")
+    for k in recs:
+        recs[k]["events"].sort(key=lambda e: e["block"])
     json.dump(recs, open(CACHE, "w"))
     print(f"\nunique positions: {len(recs)}")
 
@@ -106,14 +109,32 @@ ids = sorted(int(k) for k in recs)
 print(f"resolving PoolKey + liquidity for {len(ids)} positions...")
 
 # ---- 2. batched pool key + current liquidity -----------------------------
-info, liqv = {}, {}
+RCACHE = "data/analysis/_census_resolved.json"
+if os.path.exists(RCACHE):
+    _rc = json.load(open(RCACHE))
+    info = {int(k): v for k, v in _rc["info"].items()}
+    liqv = {int(k): v for k, v in _rc["liq"].items()}
+    print(f"loaded cached resolution for {len(info)} positions")
+else:
+    info, liqv = {}, {}
 B = 200
-for i in range(0, len(ids), B):
-    chunk = ids[i:i + B]
+todo_ids = [t for t in ids if t not in info]
+for i in range(0, len(todo_ids), B):
+    chunk = todo_ids[i:i + B]
     r1 = batch([(t, POSM, PI + f"{t:064x}") for t in chunk])
     r2 = batch([(t, POSM, PL + f"{t:064x}") for t in chunk])
     info.update(r1); liqv.update(r2)
-    print(f"  {min(i+B, len(ids))}/{len(ids)}")
+    print(f"  {min(i+B, len(todo_ids))}/{len(todo_ids)}")
+if todo_ids:
+    json.dump({"info": {str(k): v for k, v in info.items()},
+               "liq": {str(k): v for k, v in liqv.items()}}, open(RCACHE, "w"))
+
+# current owner, batched
+OWNER = "0x6352211e"
+owners = {}
+for i in range(0, len(ids), B):
+    ch = ids[i:i + B]
+    owners.update(batch([(t, POSM, OWNER + f"{t:064x}") for t in ch]))
 
 # ---- 3. token metadata ---------------------------------------------------
 def parse_key(res):
@@ -128,6 +149,23 @@ def parse_key(res):
 
 
 keys = {t: parse_key(info.get(t)) for t in ids}
+WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+USDG_A = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+NATIVE_A = "0x0000000000000000000000000000000000000000"
+ETHY = {WETH, NATIVE_A}
+
+
+def topology(c0, c1, s0, s1):
+    a, b = c0.lower(), c1.lower()
+    stable = lambda x, sym: x == USDG_A or sym.upper() in ("USDC", "USDT", "DAI", "USDG")
+    st0, st1 = stable(a, s0), stable(b, s1)
+    e0, e1 = a in ETHY, b in ETHY
+    if st0 and st1: return "stable/stable"
+    if (e0 and st1) or (e1 and st0): return "ETH/stable"
+    if e0 and e1: return "ETH/WETH"
+    if st0 or st1: return "token/stable"
+    if e0 or e1: return "token/ETH"
+    return "token/token"
 tokens = sorted({k[0] for k in keys.values() if k} | {k[1] for k in keys.values() if k})
 print(f"unique tokens touched: {len(tokens)}")
 meta = {"0x0000000000000000000000000000000000000000": ("ETH", 18)}
@@ -163,26 +201,42 @@ for t in ids:
     except Exception:
         L = 0
     r = recs[str(t)]
-    rows.append({"token_id": t, "operator": r["owner"], "cohort": r["cohort"],
+    evs = r["events"]
+    mint_ev = next((e for e in evs if e["from"] == "0x" + "00" * 20), None)
+    mint_recipient = mint_ev["to"] if mint_ev else ""
+    first_owner = evs[0]["to"]
+    owners_ever = sorted({e["to"] for e in evs})
+    cur = owners.get(t)
+    cur = ("0x" + cur[-40:]).lower() if cur and len(cur) >= 42 else ""
+    rows.append({"token_id": t, "operator": first_owner, "cohort": COHORT[first_owner],
+                 "mint_recipient": mint_recipient, "first_cluster_owner": first_owner,
+                 "current_owner": cur, "current_owner_in_cluster": cur in COHORT,
+                 "cluster_owners_ever": "|".join(owners_ever),
+                 "n_cluster_owners_ever": len(owners_ever),
                  "pool_id": pid, "pool_label": KNOWN_POOLS.get(pid, ""),
                  "token0": c0, "token0_symbol": meta.get(c0, ("?", 18))[0],
                  "token1": c1, "token1_symbol": meta.get(c1, ("?", 18))[0],
                  "fee": fee, "fee_pct": fee / 10000 if fee != 0x800000 else "dynamic",
                  "tick_spacing": ts, "hooks": hooks,
-                 "mint_block": r["block"], "mint_tx": r["tx"], "minted_directly": r["minted"],
+                 "hooked": hooks.lower() != "0x" + "00" * 20,
+                 "topology": topology(c0, c1, meta.get(c0, ("?", 18))[0], meta.get(c1, ("?", 18))[0]),
+                 "mint_block": evs[0]["block"], "mint_tx": evs[0]["tx"],
+                 "minted_directly": bool(mint_ev),
                  "current_liquidity": L, "active": L > 0})
 
 with open(OUT_POS, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
 
 pools = defaultdict(lambda: {"ops": set(), "cohorts": set(), "n": 0, "first": 10**18, "last": 0,
-                             "active": 0, "fee": 0, "t0": "", "t1": "", "hooks": ""})
+                             "active": 0, "fee": 0, "t0": "", "t1": "", "hooks": "",
+                             "topology": "", "hooked": False})
 for r in rows:
     p = pools[r["pool_id"]]
     p["ops"].add(r["operator"]); p["cohorts"].add(r["cohort"]); p["n"] += 1
     p["first"] = min(p["first"], r["mint_block"]); p["last"] = max(p["last"], r["mint_block"])
     p["active"] += bool(r["active"])
     p["fee"] = r["fee"]; p["t0"] = r["token0_symbol"]; p["t1"] = r["token1_symbol"]; p["hooks"] = r["hooks"]
+    p["topology"] = r["topology"]; p["hooked"] = r["hooked"]
 prows = []
 for pid, p in sorted(pools.items(), key=lambda kv: -kv[1]["n"]):
     prows.append({"pool_id": pid, "pair": f"{p['t0']}/{p['t1']}", "fee": p["fee"],
@@ -191,45 +245,94 @@ for pid, p in sorted(pools.items(), key=lambda kv: -kv[1]["n"]):
                   "cluster_operators": len(p["ops"]), "cohorts": "|".join(sorted(p["cohorts"])),
                   "operators": "|".join(sorted(p["ops"])),
                   "first_mint_block": p["first"], "last_mint_block": p["last"],
-                  "active_positions": p["active"],
+                  "active_positions": p["active"], "topology": p["topology"], "hooked": p["hooked"],
                   "pool_label": KNOWN_POOLS.get(pid, "")})
 with open(OUT_POOL, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=list(prows[0].keys())); w.writeheader(); w.writerows(prows)
 
 # ---- 5. summary ----------------------------------------------------------
+BASE = {"ETH", "WETH", "USDG", "USDC", "USDT", "DAI"}
+pairs = {tuple(sorted((r["token0_symbol"], r["token1_symbol"]))) for r in rows}
+nonbase = {sym for r in rows for sym in (r["token0_symbol"], r["token1_symbol"])} - BASE
+
 print("\n" + "=" * 78)
 print("CLUSTER FOOTPRINT")
 print("=" * 78)
-toks = {r["token0_symbol"] for r in rows} | {r["token1_symbol"] for r in rows}
-print(f"unique positions:        {len(rows)}")
-print(f"unique pools:            {len(prows)}")
-print(f"unique tokens:           {len(toks)}")
-print(f"active positions:        {sum(1 for r in rows if r['active'])}")
+print(f"distinct position NFTs:   {len(rows)}")
+print(f"distinct pools:           {len(prows)}")
+print(f"distinct token pairs:     {len(pairs)}")
+print(f"distinct non-base tokens: {len(nonbase)}")
+print(f"positions per pool:       {len(rows)/len(prows):.1f}")
+print(f"active positions:         {sum(1 for r in rows if r['active'])}")
+
+xfer = [r for r in rows if r["n_cluster_owners_ever"] > 1]
+notmint = [r for r in rows if not r["minted_directly"]]
+outside = [r for r in rows if r["current_owner"] and not r["current_owner_in_cluster"]]
+print(f"\npositions held by >1 cluster operator: {len(xfer)}")
+print(f"positions not minted to a cluster wallet: {len(notmint)}")
+print(f"positions now owned outside the cluster: {len(outside)}")
+
 prim = {r["pool_id"] for r in rows if r["cohort"] == "PRIMARY"}
 sec = {r["pool_id"] for r in rows if r["cohort"] == "SECONDARY"}
-print(f"pools touched by PRIMARY:        {len(prim)}")
+print(f"\npools touched by PRIMARY:        {len(prim)}")
 print(f"pools touched by SECONDARY only: {len(sec - prim)}")
 print(f"pools touched by both cohorts:   {len(prim & sec)}")
 
-print("\nfee tier distribution (by pool):")
 buckets = [(0, 100, "<=0.01%"), (100, 500, "0.01-0.05%"), (500, 3000, "0.05-0.30%"),
            (3000, 10000, "0.30-1%"), (10000, 50000, "1-5%"), (50000, 100000, "5-10%"),
            (100000, 400000, "10-40%"), (400000, 1000001, "40%+")]
-fees = [p["fee"] for p in prows if p["fee"] != 0x800000]
-for lo, hi, lab in buckets:
-    n = sum(1 for f in fees if lo <= f < hi)
-    if n: print(f"  {lab:12} n={n}")
-dyn = sum(1 for p in prows if p["fee"] == 0x800000)
-if dyn: print(f"  {'dynamic':12} n={dyn}")
-print(f"  extreme (>=10%): {sum(1 for f in fees if f >= 100000)} of {len(fees)} "
-      f"({sum(1 for f in fees if f >= 100000)/len(fees)*100:.1f}%)")
+def bucket(f):
+    for lo, hi, lab in buckets:
+        if lo <= f < hi: return lab
+    return "dynamic"
 
-print("\nshared-operator rate:")
-for k in (2, 3, 4, 5):
-    print(f"  pools with >={k} cluster operators: {sum(1 for p in prows if p['cluster_operators'] >= k)}")
+print("\nFEE TIER -- BY UNIQUE POOL")
+print(f"  {'fee':14} {'pools':>7} {'% pools':>9}")
+bp = Counter(bucket(p["fee"]) if p["fee"] != 0x800000 else "dynamic" for p in prows)
+for _, _, lab in buckets + [(0, 0, "dynamic")]:
+    if bp.get(lab): print(f"  {lab:14} {bp[lab]:>7} {bp[lab]/len(prows)*100:>8.1f}%")
+print("\nFEE TIER -- BY POSITION NFT")
+print(f"  {'fee':14} {'positions':>10} {'% positions':>12}")
+bn = Counter(bucket(r["fee"]) if r["fee"] != 0x800000 else "dynamic" for r in rows)
+for _, _, lab in buckets + [(0, 0, "dynamic")]:
+    if bn.get(lab): print(f"  {lab:14} {bn[lab]:>10} {bn[lab]/len(rows)*100:>11.1f}%")
+ext_pools = sum(1 for p in prows if p["fee"] != 0x800000 and p["fee"] >= 100000)
+ext_pos = sum(1 for r in rows if r["fee"] != 0x800000 and r["fee"] >= 100000)
+print(f"\nextreme (>=10%): {ext_pools}/{len(prows)} pools ({ext_pools/len(prows)*100:.1f}%), "
+      f"{ext_pos}/{len(rows)} positions ({ext_pos/len(rows)*100:.1f}%)")
 
-print("\ntop 20 pools by cluster positions:")
-print(f"  {'pair':22} {'fee':>9} {'pos':>4} {'ops':>4}  pool")
+print("\nFEE TIER x NUMBER OF CLUSTER OPERATORS IN POOL")
+print(f"  {'fee':14} {'1 op':>6} {'2 ops':>6} {'3 ops':>6} {'4+ ops':>7} {'mean ops':>9}")
+for _, _, lab in buckets + [(0, 0, "dynamic")]:
+    sub = [p for p in prows if (bucket(p["fee"]) if p["fee"] != 0x800000 else "dynamic") == lab]
+    if not sub: continue
+    c = Counter(min(p["cluster_operators"], 4) for p in sub)
+    mean = sum(p["cluster_operators"] for p in sub) / len(sub)
+    print(f"  {lab:14} {c.get(1,0):>6} {c.get(2,0):>6} {c.get(3,0):>6} {c.get(4,0):>7} {mean:>9.2f}")
+
+print("\nPAIR TOPOLOGY (by pool)")
+for k, v in Counter(p["topology"] for p in prows).most_common():
+    print(f"  {k:16} {v:>6} ({v/len(prows)*100:>5.1f}%)")
+print("\nHOOKS (by pool)")
+hk = Counter("hooked" if p["hooked"] else "hookless" for p in prows)
+for k, v in hk.most_common():
+    print(f"  {k:16} {v:>6} ({v/len(prows)*100:>5.1f}%)")
+
+print("\nPOSITION MULTIPLICITY")
+mult = Counter(p["cluster_positions"] for p in prows)
+for k in sorted(mult):
+    if k <= 5 or k % 10 == 0:
+        print(f"  {k:>4} position(s): {mult[k]:>5} pools")
+top = max(prows, key=lambda p: p["cluster_positions"])
+print(f"  max: {top['cluster_positions']} positions in {top['pair']} @ {top['fee_pct']}%")
+
+print("\nSHARED-OPERATOR RATE")
+for k in (2, 3, 4, 5, 6):
+    n = sum(1 for p in prows if p["cluster_operators"] >= k)
+    print(f"  pools with >={k} cluster operators: {n} ({n/len(prows)*100:.1f}%)")
+
+print("\nTOP 20 POOLS BY CLUSTER POSITIONS")
+print(f"  {'pair':24} {'fee':>9} {'pos':>4} {'ops':>4} {'topology':16}")
 for p in prows[:20]:
     fp = f"{p['fee_pct']}%" if p["fee_pct"] != "dynamic" else "dynamic"
-    print(f"  {p['pair'][:22]:22} {fp:>9} {p['cluster_positions']:>4} {p['cluster_operators']:>4}  {p['pool_id'][:18]}…")
+    print(f"  {p['pair'][:24]:24} {fp:>9} {p['cluster_positions']:>4} {p['cluster_operators']:>4} {p['topology']:16}")

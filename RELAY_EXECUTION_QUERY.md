@@ -1,7 +1,12 @@
-# Relay origin-side execution query — FIRE on Robinhood Chain
+# Relay / 0x origin-side execution query — FIRE on Robinhood Chain
 
-Prepared for sending to Relay. Everything below is derived from public chain data
-and is independently verifiable from the order IDs and transaction hashes given.
+Prepared for sending to Relay, and — see *Who actually selected the route* — to
+0x. Everything below is derived from public chain data and is independently
+verifiable from the order IDs and transaction hashes given.
+
+**Read the *Current status* section first.** The behaviour described here was
+observed 2026-07-19 to 2026-08-09. As of 2026-08-10 it does not reproduce on
+live quotes, and the pools involved are close to dormant.
 
 ## Summary
 
@@ -19,14 +24,61 @@ Measured against contemporaneous, strictly pre-trade canonical-market executions
 We are not claiming Relay violated a quote — we cannot see the quotes. We are
 asking why these routes were selected.
 
-## The question for Relay
+## Who actually selected the route
 
-1. For the 20 `orderId`s listed below, what origin-side output did Relay quote,
-   and what did the user actually receive on the destination side?
-2. Why did origin-side routing select 40–85% fee pools when the canonical 0.30%
-   ETH/FIRE pool was live and being used by other traders in the same blocks?
-3. Is the quoted-versus-delivered difference borne by the user, or absorbed by
-   the solver?
+Relay does not route the origin swap itself. Its advertised origin swap sources
+on chain 4663 are `weth`, `0x`, `magpie`, `kyberswap`, `pancakeswap` — Uniswap is
+not among them. Relay hands the origin swap to one of these.
+
+Blockscout resolves the swap senders in the 20 historical orders:
+
+```
+0x1d4b86491ec211257cbedd77a4380a7494624eff  RobinHoodSettler   11 orders
+0x8f10b468b06c6fd214b65f87778827f7d113f996  (contract)          4
+0xaa61254627b7392b0bc922097b10eb0587db2be7  RobinHoodSettler    2
+0x39b38686a19836ac10162c490e4558e120cbbe5f  RobinHoodSettler    2
+0x8876789976decbfcbbbe364623c63652db8c0904  Uniswap UniversalRouter  1
+```
+
+`RobinHoodSettler` is a 0x Protocol Settler deployment, and a live Relay quote's
+deposit calldata embeds `0x AllowanceHolder`, not the Uniswap PoolManager. So the
+pool-level route selection was made by **0x**, not by Relay and not by Uniswap.
+
+Questions 1 and 3 below are for Relay. Question 2 is for 0x.
+
+## The questions
+
+1. **(Relay)** For the 20 `orderId`s listed below, what origin-side output was
+   quoted, and what did the user receive on the destination side?
+2. **(0x)** Why did origin-side routing select 40–85% fee pools when the
+   canonical 0.30% ETH/FIRE pool was live and being used in the same blocks?
+3. **(Relay)** Is any quoted-versus-delivered difference borne by the user, or
+   absorbed by the solver?
+
+## Current status (2026-08-10) — this does not reproduce live
+
+Two checks taken today, both against current chain state:
+
+**Live quotes are not worse than canonical.** Relay's quoted origin-side USDG was
+compared against an exact same-state v4 Quoter pricing of
+FIRE → ETH (canonical 0.30%) → USDG (best low-fee ETH/USDG pool), for 12 sizes
+from 100 to 100,000 FIRE. Relay was **better in 12 of 12**, by +0.19% to +0.26%.
+
+**The pools are close to dormant.** In the most recent 400,000 blocks (~11 hours)
+the 50% and 40% pools saw **one swap each**, both buys in the same transaction,
+routed by the Uniswap Universal Router rather than a Settler.
+
+So the condition that produced the July–August routing — extreme-fee pools
+carrying real user flow at prices dislocated far enough to matter — is not
+currently present. The historical finding stands on the historical data, but it
+cannot be demonstrated on demand today.
+
+## Scale
+
+For proportionality: FIRE trades near 0.00073 USDG, so the 20 orders total
+**99.17 USDG** of user proceeds, individual orders ranging roughly 1.9 to 21.4
+USDG. The measured aggregate shortfall is **11.86 USDG**. This is a routing-
+behaviour question, not a material-loss event.
 
 ## Confirmed on-chain facts
 

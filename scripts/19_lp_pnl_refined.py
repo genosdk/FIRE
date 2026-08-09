@@ -145,16 +145,20 @@ eb = [x[0] for x in ser["eth"]]; ev = [Decimal(x[1]) for x in ser["eth"]]
 
 
 def price_at(block):
-    """canonical USDG per FIRE at `block`, using the nearest prior observation."""
+    """canonical USDG per FIRE at `block`, using the nearest prior observation.
+    Returns (price, staleness_blocks) where staleness is the age of the older
+    of the two legs -- a price from 5 blocks back and one from 50,000 blocks
+    back should not carry equal confidence."""
     i = bisect_right(fb, block) - 1
     j = bisect_right(eb, block) - 1
     if i < 0 or j < 0:
-        return None
-    return fv[i] * ev[j]
+        return None, None
+    age = max(block - fb[i], block - eb[j])
+    return fv[i] * ev[j], age
 
 
 # spot price now, for reference
-P_NOW = price_at(latest)
+P_NOW, _ = price_at(latest)
 print(f"canonical FIRE price now: {P_NOW:.12f} USDG/FIRE")
 
 # ---- deltas -------------------------------------------------------------
@@ -179,7 +183,7 @@ for name, pid in POOLS.items():
 SA = Decimal(1.0001) ** (Decimal(-880000) / 2)
 SB = Decimal(1.0001) ** (Decimal(880000) / 2)
 
-pos = defaultdict(lambda: {"pool": "", "owner": "", "liq": 0, "flows": [],
+pos = defaultdict(lambda: {"pool": "", "owner": "", "liq": 0, "flows": [], "ages": [],
                            "dep": Decimal(0), "wd": Decimal(0), "fee": Decimal(0),
                            "first": "", "last": ""})
 seen = set()
@@ -194,7 +198,11 @@ for r in liq:
     if tk in seen: continue
     seen.add(tk)
     tx = r["transaction_hash"]; blk = blk_of[tx]
-    px = price_at(blk) or P_NOW
+    px, age = price_at(blk)
+    if px is None:
+        px, age = P_NOW, None
+    else:
+        p["ages"].append(age)
     d = delta[tx]
     v = d["fire"] * px + d["usdg"]              # contemporaneous value, signed
     p["flows"].append((blk, v))
@@ -235,23 +243,43 @@ for (pool, tid), p in sorted(pos.items(), key=lambda kv: (kv[0][0], int(kv[0][1]
     rf, ru = resid_fire[(pool, tid)]
     inv = rf * liq_rate[pool] + ru
     pnl = p["wd"] + p["fee"] + inv - p["dep"]
-    # peak capital at risk
-    run, peak = Decimal(0), Decimal(0)
+    # two distinct capital measures:
+    #   external  = fresh money the operator ever had to supply, after
+    #               recycling prior withdrawals and realized fees
+    #   exposure  = peak marked value simultaneously at risk in the pool
+    run, exposure = Decimal(0), Decimal(0)
+    available, external = Decimal(0), Decimal(0)
     for blk, v in sorted(p["flows"]):
         run -= v
-        if run > peak: peak = run
+        if run > exposure: exposure = run
+        if v < 0:
+            need = -v
+            use = min(available, need)
+            available -= use
+            external += need - use
+        else:
+            available += v
     roi_dep = (pnl / p["dep"] * 100) if p["dep"] > 0 else Decimal(0)
-    roi_peak = (pnl / peak * 100) if peak > 0 else Decimal(0)
+    roi_peak = (pnl / external * 100) if external > 0 else Decimal(0)
+    ages = p["ages"]
+    ages_sorted = sorted(ages)
+    med_age = ages_sorted[len(ages_sorted) // 2] if ages_sorted else ""
+    p95_age = ages_sorted[min(len(ages_sorted) - 1, int(len(ages_sorted) * 0.95))] if ages_sorted else ""
     rows.append({"pool": pool, "token_id": tid, "owner": p["owner"],
                  "capital_deployed_gross_usdg": str(p["dep"]),
-                 "peak_capital_at_risk_usdg": str(peak),
+                 "external_capital_required_usdg": str(external),
+                 "peak_marked_exposure_usdg": str(exposure),
                  "realized_withdrawals_usdg": str(p["wd"]),
                  "realized_fees_usdg": str(p["fee"]),
                  "residual_fire": str(rf), "residual_usdg": str(ru),
+                 "residual_spot_mark_usdg": str(rf * P_NOW + ru),
                  "inventory_liquidation_usdg": str(inv),
+                 "liquidation_haircut_pct": str(((rf * liq_rate[pool] - rf * P_NOW) / (rf * P_NOW) * 100)
+                                                if rf > 0 else Decimal(0)),
+                 "price_age_median_blocks": med_age, "price_age_p95_blocks": p95_age,
                  "net_pnl_usdg": str(pnl),
                  "roi_on_gross_pct": str(roi_dep),
-                 "roi_on_peak_pct": str(roi_peak),
+                 "roi_on_external_pct": str(roi_peak),
                  "first_seen": p["first"], "last_seen": p["last"]})
 
 with open(OUT_POS, "w", newline="", encoding="utf-8") as f:
@@ -261,17 +289,18 @@ op = defaultdict(lambda: defaultdict(Decimal))
 opm = defaultdict(lambda: {"pos": 0, "pools": set()})
 for r in rows:
     o = r["owner"]
-    for k in ("capital_deployed_gross_usdg", "peak_capital_at_risk_usdg",
-              "realized_withdrawals_usdg", "realized_fees_usdg",
+    for k in ("capital_deployed_gross_usdg", "external_capital_required_usdg",
+              "peak_marked_exposure_usdg", "realized_withdrawals_usdg",
+              "realized_fees_usdg", "residual_spot_mark_usdg",
               "inventory_liquidation_usdg", "net_pnl_usdg"):
         op[o][k] += Decimal(r[k])
     opm[o]["pos"] += 1; opm[o]["pools"].add(r["pool"])
 oprows = []
 for o, v in sorted(op.items(), key=lambda kv: -kv[1]["net_pnl_usdg"]):
-    pk = v["peak_capital_at_risk_usdg"]
+    pk = v["external_capital_required_usdg"]
     oprows.append({"operator": o, "positions": opm[o]["pos"], "pools": "|".join(sorted(opm[o]["pools"])),
                    **{k: str(v[k]) for k in v},
-                   "roi_on_peak_pct": str(v["net_pnl_usdg"] / pk * 100 if pk > 0 else 0)})
+                   "roi_on_external_pct": str(v["net_pnl_usdg"] / pk * 100 if pk > 0 else 0)})
 with open(OUT_OP, "w", newline="", encoding="utf-8") as f:
     wr = csv.DictWriter(f, fieldnames=list(oprows[0].keys())); wr.writeheader(); wr.writerows(oprows)
 
@@ -281,17 +310,23 @@ for pool in POOLS:
     rs = [r for r in rows if r["pool"] == pool]
     print(f"\n{pool}")
     print(f"  gross deployed (contemporaneous) {T(rs,'capital_deployed_gross_usdg'):>10.2f} USDG")
-    print(f"  PEAK capital at risk             {T(rs,'peak_capital_at_risk_usdg'):>10.2f} USDG")
+    print(f"  EXTERNAL capital required        {T(rs,'external_capital_required_usdg'):>10.2f} USDG")
+    print(f"  peak marked exposure             {T(rs,'peak_marked_exposure_usdg'):>10.2f} USDG")
     print(f"  realized withdrawals             {T(rs,'realized_withdrawals_usdg'):>10.2f} USDG")
     print(f"  realized fees (pokes)            {T(rs,'realized_fees_usdg'):>10.2f} USDG")
+    print(f"  residual spot mark               {T(rs,'residual_spot_mark_usdg'):>10.2f} USDG")
     print(f"  inventory (liquidation-adjusted) {T(rs,'inventory_liquidation_usdg'):>10.2f} USDG")
     print(f"  NET P&L                          {T(rs,'net_pnl_usdg'):>10.2f} USDG")
-    g, pk = T(rs, 'capital_deployed_gross_usdg'), T(rs, 'peak_capital_at_risk_usdg')
+    g, ex = T(rs, 'capital_deployed_gross_usdg'), T(rs, 'external_capital_required_usdg')
     print(f"  ROI on gross                     {(T(rs,'net_pnl_usdg')/g*100 if g>0 else 0):>9.1f}%")
-    print(f"  ROI on peak capital              {(T(rs,'net_pnl_usdg')/pk*100 if pk>0 else 0):>9.1f}%")
+    print(f"  ROI on EXTERNAL capital          {(T(rs,'net_pnl_usdg')/ex*100 if ex>0 else 0):>9.1f}%")
 allr = rows
+ages = sorted(int(r["price_age_median_blocks"]) for r in allr if r["price_age_median_blocks"] != "")
+if ages:
+    print(f"\nprice staleness across positions: median {ages[len(ages)//2]:,} blocks, "
+          f"p95 {ages[min(len(ages)-1,int(len(ages)*0.95))]:,} blocks")
 print(f"\nCOMBINED  gross {T(allr,'capital_deployed_gross_usdg'):.2f}  "
-      f"peak {T(allr,'peak_capital_at_risk_usdg'):.2f}  "
+      f"external {T(allr,'external_capital_required_usdg'):.2f}  "
       f"fees {T(allr,'realized_fees_usdg'):.2f}  P&L {T(allr,'net_pnl_usdg'):.2f}")
 fee_share = T(allr, 'realized_fees_usdg') / T(allr, 'net_pnl_usdg') * 100
 print(f"fee share of P&L: {fee_share:.1f}%")

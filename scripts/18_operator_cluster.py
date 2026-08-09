@@ -18,7 +18,7 @@ BS = "https://robinhoodchain.blockscout.com"
 LIQ = "data/liquidity/FIRE_USDG_ALL_modify_liquidity.csv"
 OUT = "data/analysis/LP_OPERATOR_CLUSTER.csv"
 OUT_LINKS = "data/analysis/LP_OPERATOR_LINKS.csv"
-PACE = 2.5
+PACE = 6.0
 
 KNOWN = {
     "0x8366a39cc670b4001a1121b8f6a443a643e40951": "UniV4 PoolManager",
@@ -37,7 +37,7 @@ KNOWN = {
 }
 
 
-def api(params, tries=6):
+def api(params, tries=8):
     """v1 API call with backoff on rate limiting."""
     url = f"{BS}/api?" + "&".join(f"{k}={v}" for k, v in params.items())
     for a in range(tries):
@@ -46,7 +46,7 @@ def api(params, tries=6):
                                capture_output=True, text=True, check=True)
             d = json.loads(p.stdout)
             if isinstance(d, dict) and "Too many requests" in str(d.get("message", "")):
-                time.sleep(3.0 * (a + 1)); continue
+                time.sleep(6.0 * (a + 1)); continue
             return d
         except Exception:
             time.sleep(2.0 * (a + 1))
@@ -66,6 +66,10 @@ for i, a in enumerate(ops, 1):
                      "page": 1, "offset": 5, "sort": "asc"})
     time.sleep(PACE)
 
+    fail = []
+    if not first_ext or first_ext.get("status") != "1": fail.append("txlist")
+    if not first_int or first_int.get("status") != "1": fail.append("internal")
+
     def first_inbound(res):
         if not res or res.get("status") != "1" or not isinstance(res.get("result"), list):
             return None
@@ -82,18 +86,19 @@ for i, a in enumerate(ops, 1):
 
     # counterparty census from the first N pages of external txs
     counter = Counter()
-    for page in (1, 2, 3):
+    for page in (1, 2):
         r = api({"module": "account", "action": "txlist", "address": a,
-                 "page": page, "offset": 100, "sort": "asc"})
+                 "page": page, "offset": 50, "sort": "asc"})
         time.sleep(PACE)
         if not r or r.get("status") != "1" or not isinstance(r.get("result"), list):
+            fail.append(f"cp-page{page}")
             break
         for t in r["result"]:
             f = (t.get("from") or "").lower(); to = (t.get("to") or "").lower()
             other = to if f == a else f
             if other and other != a:
                 counter[other] += 1
-        if len(r["result"]) < 100:
+        if len(r["result"]) < 50:
             break
     cps[a] = counter
 
@@ -103,10 +108,12 @@ for i, a in enumerate(ops, 1):
                  "first_funding_tx": (first or {}).get("hash", ""),
                  "first_funding_value_eth": str(int((first or {}).get("value", "0") or 0) / 1e18),
                  "first_funding_ts": (first or {}).get("timeStamp", ""),
+                 "failed_calls": "|".join(fail),
                  "distinct_counterparties": len(counter),
                  "top_counterparties": "|".join(f"{k}:{v}" for k, v in counter.most_common(6))})
     print(f"[{i:02}/{len(ops)}] {a}  funder={funder or '?'} "
-          f"{KNOWN.get(funder,'')}  cps={len(counter)}")
+          f"{KNOWN.get(funder,'')}  cps={len(counter)}"
+          + (f"  FAILED:{','.join(fail)}" if fail else ""))
 
 with open(OUT, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
@@ -126,6 +133,9 @@ if links:
         w = csv.DictWriter(f, fieldnames=list(links[0].keys())); w.writeheader(); w.writerows(links)
 
 print(f"\nWrote {OUT}" + (f" and {OUT_LINKS}" if links else "  (no shared non-infra counterparties)"))
+bad = [r for r in rows if r["failed_calls"]]
+print(f"\nrows with failed API calls: {len(bad)}/{len(rows)}"
+      + ("  -- treat their links as incomplete" if bad else ""))
 print("\nFunder frequency:")
 for k, v in Counter(r["first_funder"] for r in rows if r["first_funder"]).most_common():
     tag = KNOWN.get(k, "")

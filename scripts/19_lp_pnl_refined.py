@@ -175,15 +175,30 @@ def s128(x):
     v = int(x, 16) & ((1 << 128) - 1)
     return v - (1 << 128) if v >= 1 << 127 else v
 
-sqrtP = {}
-for name, pid in POOLS.items():
-    lgs = chunked(PM, [SWAP, pid], START, latest, 400_000)
-    d = lgs[-1]["data"][2:]; ws = [d[i:i + 64] for i in range(0, len(d), 64)]
-    sqrtP[name] = Decimal(int(ws[2], 16)) / Decimal(2 ** 96)
+POOLSER = "data/analysis/_pool_sqrt_series.json"
+if os.path.exists(POOLSER):
+    _ps = json.load(open(POOLSER))
+else:
+    _ps = {}
+    for name, pid in POOLS.items():
+        lgs = chunked(PM, [SWAP, pid], START, latest, 400_000)
+        obs = []
+        for L in lgs:
+            d = L["data"][2:]; ws = [d[i:i + 64] for i in range(0, len(d), 64)]
+            obs.append((int(L["blockNumber"], 16), str(Decimal(int(ws[2], 16)) / Decimal(2 ** 96))))
+        _ps[name] = obs
+    json.dump(_ps, open(POOLSER, "w"))
+pool_blocks = {k: [o[0] for o in v] for k, v in _ps.items()}
+pool_sqrt = {k: [Decimal(o[1]) for o in v] for k, v in _ps.items()}
+sqrtP = {k: pool_sqrt[k][-1] for k in _ps}
+
+def pool_sqrt_at(pool, block):
+    i = bisect_right(pool_blocks[pool], block) - 1
+    return pool_sqrt[pool][i] if i >= 0 else pool_sqrt[pool][0]
 SA = Decimal(1.0001) ** (Decimal(-880000) / 2)
 SB = Decimal(1.0001) ** (Decimal(880000) / 2)
 
-pos = defaultdict(lambda: {"pool": "", "owner": "", "liq": 0, "flows": [], "ages": [],
+pos = defaultdict(lambda: {"pool": "", "owner": "", "liq": 0, "flows": [], "liqpath": [], "ages": [],
                            "dep": Decimal(0), "wd": Decimal(0), "fee": Decimal(0),
                            "first": "", "last": ""})
 seen = set()
@@ -206,6 +221,7 @@ for r in liq:
     d = delta[tx]
     v = d["fire"] * px + d["usdg"]              # contemporaneous value, signed
     p["flows"].append((blk, v))
+    p["liqpath"].append((blk, int(r["liquidity_delta"])))
     if v < 0:
         p["dep"] += -v
     elif tx_action[tx] == {"ZERO"}:
@@ -247,11 +263,8 @@ for (pool, tid), p in sorted(pos.items(), key=lambda kv: (kv[0][0], int(kv[0][1]
     #   external  = fresh money the operator ever had to supply, after
     #               recycling prior withdrawals and realized fees
     #   exposure  = peak marked value simultaneously at risk in the pool
-    run, exposure = Decimal(0), Decimal(0)
     available, external = Decimal(0), Decimal(0)
     for blk, v in sorted(p["flows"]):
-        run -= v
-        if run > exposure: exposure = run
         if v < 0:
             need = -v
             use = min(available, need)
@@ -259,6 +272,22 @@ for (pool, tid), p in sorted(pos.items(), key=lambda kv: (kv[0][0], int(kv[0][1]
             external += need - use
         else:
             available += v
+    # peak MARKED exposure: value of the live position at each event block
+    exposure = Decimal(0)
+    Lrun = 0
+    for blk, dl in sorted(p["liqpath"]):
+        Lrun += dl
+        if Lrun <= 0:
+            continue
+        S = pool_sqrt_at(pool, blk)
+        px_b, _ = price_at(blk)
+        if px_b is None:
+            px_b = P_NOW
+        f = Decimal(Lrun) * (Decimal(1) / S - Decimal(1) / SB) / Decimal(10 ** 18)
+        u = Decimal(Lrun) * (S - SA) / Decimal(10 ** 6)
+        val = f * px_b + u
+        if val > exposure:
+            exposure = val
     roi_dep = (pnl / p["dep"] * 100) if p["dep"] > 0 else Decimal(0)
     roi_peak = (pnl / external * 100) if external > 0 else Decimal(0)
     ages = p["ages"]

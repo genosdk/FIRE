@@ -131,8 +131,15 @@ owner_of_tx = {}
 for r in liq:
     owner_of_tx[r["transaction_hash"]] = r["tx_from"].lower()
 
+import os
+CACHE = "data/analysis/_lp_tx_deltas.json"
+cached = json.load(open(CACHE)) if os.path.exists(CACHE) else {}
 delta = defaultdict(lambda: {"fire": Decimal(0), "usdg": Decimal(0)})
-for i, tx in enumerate(txs, 1):
+for k, v in cached.items():
+    delta[k] = {"fire": Decimal(v["fire"]), "usdg": Decimal(v["usdg"])}
+todo = [t for t in txs if t not in cached]
+print(f"  cached {len(cached)}, fetching {len(todo)}")
+for i, tx in enumerate(todo, 1):
     rc = rpc("eth_getTransactionReceipt", [tx])
     own = owner_of_tx[tx]
     for l in rc["logs"]:
@@ -147,15 +154,26 @@ for i, tx in enumerate(txs, 1):
         k = "fire" if a == FIRE else "usdg"
         if to == own: delta[tx][k] += v
         if frm == own: delta[tx][k] -= v
-    if i % 40 == 0 or i == len(txs):
-        print(f"  scanned {i}/{len(txs)}")
+    if i % 40 == 0 or i == len(todo):
+        print(f"  scanned {i}/{len(todo)}")
+json.dump({k: {"fire": str(v["fire"]), "usdg": str(v["usdg"])} for k, v in delta.items()},
+          open(CACHE, "w"))
 
-# ---- aggregate per position and per operator --------------------------
-pos = defaultdict(lambda: {"pool": "", "owner": "", "liq": 0,
-                           "fire": Decimal(0), "usdg": Decimal(0),
-                           "adds": 0, "removes": 0, "zeros": 0, "events": 0,
-                           "first": "", "last": ""})
-seen_tx = set()
+# ---- aggregate per position, split by action --------------------------
+# each LP tx is classified by the ModifyLiquidity action(s) it contains, so
+# deposits, withdrawals and fee-realizing pokes are reported separately.
+tx_action = defaultdict(set)
+for r in liq:
+    tx_action[r["transaction_hash"]].add(r["action"])
+
+pos = defaultdict(lambda: {"pool": "", "owner": "", "liq": 0, "events": 0,
+                           "adds": 0, "removes": 0, "zeros": 0,
+                           "in_fire": Decimal(0), "in_usdg": Decimal(0),
+                           "first_fire": Decimal(0), "first_usdg": Decimal(0),
+                           "wd_fire": Decimal(0), "wd_usdg": Decimal(0),
+                           "fee_fire": Decimal(0), "fee_usdg": Decimal(0),
+                           "first": "", "last": "", "seeded": False})
+seen = set()
 for r in liq:
     key = (r["pool"], r["possible_token_id"])
     p = pos[key]
@@ -166,26 +184,46 @@ for r in liq:
     if not p["first"]: p["first"] = r["timestamp_utc"]
     p["last"] = r["timestamp_utc"]
     tk = (r["transaction_hash"], key)
-    if tk not in seen_tx:
-        seen_tx.add(tk)
-        p["fire"] += delta[r["transaction_hash"]]["fire"]
-        p["usdg"] += delta[r["transaction_hash"]]["usdg"]
+    if tk in seen: continue
+    seen.add(tk)
+    d = delta[r["transaction_hash"]]
+    acts = tx_action[r["transaction_hash"]]
+    # negative delta = owner paid in; positive = owner took out
+    if d["fire"] < 0 or d["usdg"] < 0:
+        f, u = -min(d["fire"], Decimal(0)), -min(d["usdg"], Decimal(0))
+        if not p["seeded"]:
+            p["first_fire"] += f; p["first_usdg"] += u; p["seeded"] = True
+        else:
+            p["in_fire"] += f; p["in_usdg"] += u
+    if d["fire"] > 0 or d["usdg"] > 0:
+        f, u = max(d["fire"], Decimal(0)), max(d["usdg"], Decimal(0))
+        if acts == {"ZERO"}:
+            p["fee_fire"] += f; p["fee_usdg"] += u
+        else:
+            p["wd_fire"] += f; p["wd_usdg"] += u
 
 rows = []
 for (pool, tid), p in sorted(pos.items(), key=lambda kv: (kv[0][0], int(kv[0][1]))):
-    L = Decimal(p["liq"])
-    S = sqrtP[pool]
+    L = Decimal(p["liq"]); S = sqrtP[pool]
     res_fire = L * (Decimal(1) / S - Decimal(1) / SB) / Decimal(10 ** 18) if L > 0 else Decimal(0)
     res_usdg = L * (S - SA) / Decimal(10 ** 6) if L > 0 else Decimal(0)
-    pnl = (p["fire"] + res_fire) * P_FIRE + (p["usdg"] + res_usdg)
-    invested = max(Decimal(0), -(p["fire"] * P_FIRE + p["usdg"]))
-    roi = (pnl / invested * 100) if invested > 0 else Decimal(0)
+    val = lambda f, u: f * P_FIRE + u
+    initial = val(p["first_fire"], p["first_usdg"])
+    extra = val(p["in_fire"], p["in_usdg"])
+    deployed = initial + extra
+    wd = val(p["wd_fire"], p["wd_usdg"])
+    fees = val(p["fee_fire"], p["fee_usdg"])
+    inv = val(res_fire, res_usdg)
+    pnl = wd + fees + inv - deployed
+    roi = (pnl / deployed * 100) if deployed > 0 else Decimal(0)
     rows.append({"pool": pool, "token_id": tid, "owner": p["owner"],
                  "events": p["events"], "adds": p["adds"], "removes": p["removes"], "zeros": p["zeros"],
                  "net_liquidity": p["liq"],
-                 "realized_fire": str(p["fire"]), "realized_usdg": str(p["usdg"]),
+                 "initial_capital_usdg": str(initial), "additional_capital_usdg": str(extra),
+                 "capital_deployed_usdg": str(deployed),
+                 "realized_withdrawals_usdg": str(wd), "realized_fees_usdg": str(fees),
                  "residual_fire": str(res_fire), "residual_usdg": str(res_usdg),
-                 "capital_deployed_usdg": str(invested),
+                 "current_inventory_usdg": str(inv),
                  "net_pnl_usdg": str(pnl), "roi_pct": str(roi),
                  "first_seen": p["first"], "last_seen": p["last"]})
 
@@ -196,8 +234,9 @@ op = defaultdict(lambda: defaultdict(Decimal))
 opmeta = defaultdict(lambda: {"positions": 0, "pools": set(), "events": 0})
 for r in rows:
     o = r["owner"]
-    for k in ("realized_fire", "realized_usdg", "residual_fire", "residual_usdg",
-              "capital_deployed_usdg", "net_pnl_usdg"):
+    for k in ("initial_capital_usdg", "additional_capital_usdg", "capital_deployed_usdg",
+              "realized_withdrawals_usdg", "realized_fees_usdg", "current_inventory_usdg",
+              "net_pnl_usdg"):
         op[o][k] += Decimal(r[k])
     opmeta[o]["positions"] += 1; opmeta[o]["pools"].add(r["pool"]); opmeta[o]["events"] += int(r["events"])
 oprows = []
@@ -205,8 +244,11 @@ for o, v in sorted(op.items(), key=lambda kv: -kv[1]["net_pnl_usdg"]):
     cap = v["capital_deployed_usdg"]
     oprows.append({"operator": o, "positions": opmeta[o]["positions"],
                    "pools": "|".join(sorted(opmeta[o]["pools"])), "events": opmeta[o]["events"],
-                   "realized_fire": str(v["realized_fire"]), "realized_usdg": str(v["realized_usdg"]),
-                   "residual_fire": str(v["residual_fire"]), "residual_usdg": str(v["residual_usdg"]),
+                   "initial_capital_usdg": str(v["initial_capital_usdg"]),
+                   "additional_capital_usdg": str(v["additional_capital_usdg"]),
+                   "realized_withdrawals_usdg": str(v["realized_withdrawals_usdg"]),
+                   "realized_fees_usdg": str(v["realized_fees_usdg"]),
+                   "current_inventory_usdg": str(v["current_inventory_usdg"]),
                    "capital_deployed_usdg": str(cap), "net_pnl_usdg": str(v["net_pnl_usdg"]),
                    "roi_pct": str(v["net_pnl_usdg"] / cap * 100 if cap > 0 else 0)})
 with open(OUT_OP, "w", newline="", encoding="utf-8") as f:
@@ -217,18 +259,23 @@ print("\n" + "=" * 78)
 for pool in POOLS:
     rs = [r for r in rows if r["pool"] == pool]
     tot = lambda k: sum(Decimal(r[k]) for r in rs)
+    dep = tot("capital_deployed_usdg")
     print(f"\n{pool}")
-    print(f"  positions            {len(rs)}")
-    print(f"  operators            {len(set(r['owner'] for r in rs))}")
-    print(f"  capital deployed     {tot('capital_deployed_usdg'):>14.6f} USDG-equiv")
-    print(f"  realized FIRE        {tot('realized_fire'):>14.4f}")
-    print(f"  realized USDG        {tot('realized_usdg'):>14.6f}")
-    print(f"  residual FIRE        {tot('residual_fire'):>14.4f}")
-    print(f"  residual USDG        {tot('residual_usdg'):>14.6f}")
-    print(f"  NET P&L              {tot('net_pnl_usdg'):>14.6f} USDG")
-    cap = tot('capital_deployed_usdg')
-    print(f"  ROI                  {(tot('net_pnl_usdg')/cap*100 if cap>0 else 0):>13.2f}%")
+    print(f"  positions               {len(rs)}")
+    print(f"  operators               {len(set(r['owner'] for r in rs))}")
+    print(f"  initial capital         {tot('initial_capital_usdg'):>12.4f} USDG")
+    print(f"  additional capital      {tot('additional_capital_usdg'):>12.4f} USDG")
+    print(f"  total deployed          {dep:>12.4f} USDG")
+    print(f"  realized withdrawals    {tot('realized_withdrawals_usdg'):>12.4f} USDG")
+    print(f"  realized fees (pokes)   {tot('realized_fees_usdg'):>12.4f} USDG")
+    print(f"  current inventory       {tot('current_inventory_usdg'):>12.4f} USDG")
+    print(f"    residual FIRE         {tot('residual_fire'):>12.1f}")
+    print(f"    residual USDG         {tot('residual_usdg'):>12.4f}")
+    print(f"  NET P&L                 {tot('net_pnl_usdg'):>12.4f} USDG")
+    print(f"  ROI on deployed         {(tot('net_pnl_usdg')/dep*100 if dep>0 else 0):>11.1f}%")
 print("\nTop operators by net P&L:")
-for r in oprows[:8]:
-    print(f"  {r['operator']}  pos={r['positions']:2}  cap={Decimal(r['capital_deployed_usdg']):>9.4f}  "
-          f"pnl={Decimal(r['net_pnl_usdg']):>+9.4f}  roi={Decimal(r['roi_pct']):>+8.2f}%  {r['pools']}")
+for r in oprows[:10]:
+    dep = Decimal(r["capital_deployed_usdg"])
+    print(f"  {r['operator']}  pos={r['positions']:2}  dep={dep:>8.3f}  "
+          f"fees={Decimal(r['realized_fees_usdg']):>7.3f}  inv={Decimal(r['current_inventory_usdg']):>8.3f}  "
+          f"pnl={Decimal(r['net_pnl_usdg']):>+9.3f}  roi={(Decimal(r['roi_pct'])):>+9.1f}%  {r['pools']}")

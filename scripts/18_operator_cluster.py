@@ -1,21 +1,24 @@
 """Operator wallet-tree tracing for the extreme-fee FIRE/USDG LPs.
 
-For each LP operator address: transaction counters, the earliest inbound native
-transfer (the funder), and the full counterparty set. Shared funders or shared
-counterparties across operators are the evidence for a single coordinated
-cluster versus independent strategies.
+Identifies, for each LP operator: the funding transaction that first credited the
+address (its funder), and its counterparty set. Shared funders or shared
+non-infrastructure counterparties across operators are the evidence for a single
+coordinated cluster rather than independent strategies.
 
-Uses Blockscout (native transfers are not logs, so eth_getLogs cannot see them,
-and the RPC retains only ~6,200 blocks of state).
+Native transfers are not logs and the RPC retains only ~6,200 blocks of state,
+so Blockscout is the only source. Uses the v1 (etherscan-compatible) API because
+it supports sort=asc, which returns the oldest transaction directly -- the v2 API
+pages newest-first and some operators have thousands of transactions.
+Blockscout rate-limits aggressively, hence the pacing and backoff.
 """
 import csv, json, subprocess, time
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 
 BS = "https://robinhoodchain.blockscout.com"
 LIQ = "data/liquidity/FIRE_USDG_ALL_modify_liquidity.csv"
 OUT = "data/analysis/LP_OPERATOR_CLUSTER.csv"
 OUT_LINKS = "data/analysis/LP_OPERATOR_LINKS.csv"
-MAX_PAGES = 40
+PACE = 2.5
 
 KNOWN = {
     "0x8366a39cc670b4001a1121b8f6a443a643e40951": "UniV4 PoolManager",
@@ -29,17 +32,24 @@ KNOWN = {
     "0xaa61254627b7392b0bc922097b10eb0587db2be7": "RobinHoodSettler (0x)",
     "0x39b38686a19836ac10162c490e4558e120cbbe5f": "RobinHoodSettler (0x)",
     "0x0000000000001ff3684f28c67538d4d072c22734": "0x AllowanceHolder",
+    "0x43eea882b845a8493152ebc55cf30ae9281b02d5": "FIRE token",
+    "0x5fc5360d0400a0fd4f2af552add042d716f1d168": "USDG token",
 }
 
 
-def get(path, tries=3):
+def api(params, tries=6):
+    """v1 API call with backoff on rate limiting."""
+    url = f"{BS}/api?" + "&".join(f"{k}={v}" for k, v in params.items())
     for a in range(tries):
         try:
-            p = subprocess.run(["curl", "-sS", "--max-time", "35", f"{BS}{path}"],
+            p = subprocess.run(["curl", "-sS", "--max-time", "35", url],
                                capture_output=True, text=True, check=True)
-            return json.loads(p.stdout)
+            d = json.loads(p.stdout)
+            if isinstance(d, dict) and "Too many requests" in str(d.get("message", "")):
+                time.sleep(3.0 * (a + 1)); continue
+            return d
         except Exception:
-            time.sleep(0.5 * (a + 1))
+            time.sleep(2.0 * (a + 1))
     return None
 
 
@@ -47,57 +57,65 @@ ops = sorted({r["tx_from"].lower() for r in csv.DictReader(open(LIQ))})
 print(f"LP operators: {len(ops)}\n")
 
 rows = []
-counterparties = {}
+cps = {}
 for i, a in enumerate(ops, 1):
-    c = get(f"/api/v2/addresses/{a}/counters") or {}
-    ntx = c.get("transactions_count", "?")
-    info = get(f"/api/v2/addresses/{a}") or {}
-    # page to the oldest inbound transaction
-    oldest = None
-    cps = Counter()
-    params = ""
-    pages = 0
-    while pages < MAX_PAGES:
-        d = get(f"/api/v2/addresses/{a}/transactions{params}")
-        if not d or "items" not in d:
+    first_ext = api({"module": "account", "action": "txlist", "address": a,
+                     "page": 1, "offset": 5, "sort": "asc"})
+    time.sleep(PACE)
+    first_int = api({"module": "account", "action": "txlistinternal", "address": a,
+                     "page": 1, "offset": 5, "sort": "asc"})
+    time.sleep(PACE)
+
+    def first_inbound(res):
+        if not res or res.get("status") != "1" or not isinstance(res.get("result"), list):
+            return None
+        for t in res["result"]:
+            if (t.get("to") or "").lower() == a and (t.get("from") or "").lower() != a:
+                if int(t.get("value", "0") or 0) > 0:
+                    return t
+        return None
+
+    fe, fi = first_inbound(first_ext), first_inbound(first_int)
+    cand = [x for x in (fe, fi) if x]
+    first = min(cand, key=lambda t: int(t["timeStamp"])) if cand else None
+    funder = (first or {}).get("from", "").lower()
+
+    # counterparty census from the first N pages of external txs
+    counter = Counter()
+    for page in (1, 2, 3):
+        r = api({"module": "account", "action": "txlist", "address": a,
+                 "page": page, "offset": 100, "sort": "asc"})
+        time.sleep(PACE)
+        if not r or r.get("status") != "1" or not isinstance(r.get("result"), list):
             break
-        for t in d["items"]:
-            f = ((t.get("from") or {}).get("hash") or "").lower()
-            to = ((t.get("to") or {}).get("hash") or "").lower()
+        for t in r["result"]:
+            f = (t.get("from") or "").lower(); to = (t.get("to") or "").lower()
             other = to if f == a else f
-            if other:
-                cps[other] += 1
-            if f != a:
-                oldest = t          # list is newest-first, so last seen inbound is oldest so far
-        np = d.get("next_page_params")
-        pages += 1
-        if not np:
+            if other and other != a:
+                counter[other] += 1
+        if len(r["result"]) < 100:
             break
-        params = "?" + "&".join(f"{k}={v}" for k, v in np.items() if v is not None)
-    funder = ((oldest or {}).get("from") or {}).get("hash", "")
-    funder = funder.lower() if funder else ""
-    counterparties[a] = cps
-    rows.append({"operator": a, "tx_count": ntx,
-                 "is_contract": info.get("is_contract"),
-                 "name": info.get("name") or "",
+    cps[a] = counter
+
+    rows.append({"operator": a,
                  "first_funder": funder,
                  "first_funder_label": KNOWN.get(funder, ""),
-                 "first_seen_tx": (oldest or {}).get("hash", ""),
-                 "first_seen_at": (oldest or {}).get("timestamp", ""),
-                 "distinct_counterparties": len(cps),
-                 "pages_scanned": pages})
-    print(f"[{i:02}/{len(ops)}] {a}  txs={ntx}  funder={funder or '?'} "
-          f"{KNOWN.get(funder,'')}  counterparties={len(cps)}")
+                 "first_funding_tx": (first or {}).get("hash", ""),
+                 "first_funding_value_eth": str(int((first or {}).get("value", "0") or 0) / 1e18),
+                 "first_funding_ts": (first or {}).get("timeStamp", ""),
+                 "distinct_counterparties": len(counter),
+                 "top_counterparties": "|".join(f"{k}:{v}" for k, v in counter.most_common(6))})
+    print(f"[{i:02}/{len(ops)}] {a}  funder={funder or '?'} "
+          f"{KNOWN.get(funder,'')}  cps={len(counter)}")
 
 with open(OUT, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
 
-# shared non-infrastructure counterparties between operators
 opset = set(ops)
 links = []
 for i, a in enumerate(ops):
     for b in ops[i + 1:]:
-        shared = set(counterparties.get(a, {})) & set(counterparties.get(b, {}))
+        shared = set(cps.get(a, {})) & set(cps.get(b, {}))
         shared = {s for s in shared if s not in KNOWN and s not in opset}
         if shared:
             links.append({"operator_a": a, "operator_b": b, "shared_count": len(shared),
@@ -107,10 +125,12 @@ if links:
     with open(OUT_LINKS, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(links[0].keys())); w.writeheader(); w.writerows(links)
 
-print(f"\nWrote {OUT}" + (f" and {OUT_LINKS}" if links else " (no shared-counterparty links found)"))
+print(f"\nWrote {OUT}" + (f" and {OUT_LINKS}" if links else "  (no shared non-infra counterparties)"))
 print("\nFunder frequency:")
 for k, v in Counter(r["first_funder"] for r in rows if r["first_funder"]).most_common():
-    print(f"  {v:2}  {k}  {KNOWN.get(k,'')}")
-print("\nStrongest operator links (shared non-infrastructure counterparties):")
-for l in links[:10]:
-    print(f"  {l['shared_count']:3}  {l['operator_a'][:12]}… <-> {l['operator_b'][:12]}…")
+    tag = KNOWN.get(k, "")
+    shared = " <-- SHARED FUNDER" if v > 1 else ""
+    print(f"  {v:2}  {k}  {tag}{shared}")
+print("\nOperator pairs by shared non-infrastructure counterparties:")
+for l in links[:12]:
+    print(f"  {l['shared_count']:3}  {l['operator_a'][:14]}… <-> {l['operator_b'][:14]}…")

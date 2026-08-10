@@ -42,7 +42,14 @@ def key(L):
     return (int(L["blockNumber"], 16), int(L["transactionIndex"], 16), int(L["logIndex"], 16))
 
 
+WCACHE = "data/analysis/_cf_state_windows.json"
+_wc = json.load(open(WCACHE)) if os.path.exists(WCACHE) else {}
+
+
 def swaps_in(pool, lo, hi):
+    ck = f"{pool}:{lo}:{hi}"
+    if ck in _wc:
+        return [{**s, "k": tuple(s["k"])} for s in _wc[ck]]
     out = []
     for L in sr.logs_adaptive([SWAP, pool], max(0, lo), hi):
         d = L["data"][2:]
@@ -52,6 +59,9 @@ def swaps_in(pool, lo, hi):
                     "fee": int(w[5], 16) & 0xFFFFFF,
                     "sender": ("0x" + L["topics"][2][26:]).lower()})
     out.sort(key=lambda x: x["k"])
+    _wc[ck] = [{**s, "k": list(s["k"])} for s in out]
+    if len(_wc) % 10 == 0:
+        json.dump(_wc, open(WCACHE, "w"))
     return out
 
 
@@ -76,6 +86,23 @@ for r in csv.DictReader(open(CENSUS)):
         if int(r["fee"]) <= 10000:
             bridges.append(r)
 print(f"ETH/USDG v4 bridge candidates (fee<=1%): {len(bridges)}")
+_probe_hi = int(sr.rpc("eth_blockNumber", []), 16)
+_probe_lo = _probe_hi - 300_000
+ranked = []
+for _b in bridges:
+    try:
+        n = len(swaps_in(_b["pool_id"], _probe_lo, _probe_hi))
+    except Exception:
+        n = 0
+    if n:
+        ranked.append((n, _b))
+    time.sleep(0.3)
+ranked.sort(key=lambda x: -x[0])
+bridges = [b for _, b in ranked[:3]]
+json.dump(_wc, open(WCACHE, "w"))
+print("bridges kept (most active in a recent 300k-block probe):")
+for n, b in ranked[:3]:
+    print(f"  {b['pool_id'][:20]}…  fee={int(b['fee'])/10000:.3f}%  recent swaps={n}")
 
 hops = list(csv.DictReader(open(HOPS)))
 orders = defaultdict(list)
@@ -102,7 +129,8 @@ for i, (tx, hs) in enumerate(sorted(orders.items()), 1):
         if p:
             bridge_state[tx][br["pool_id"]] = p[-1]
             bridge_hist[tx][br["pool_id"]] = bs
-    time.sleep(0.5)
+    json.dump(_wc, open(WCACHE, "w"))
+    time.sleep(0.8)
     print(f"  {i}/{len(orders)}  canonical_obs={len(cs)}  bridges_with_state={len(bridge_state[tx])}")
 
 # ---- validate the (sqrtP, L)-from-previous-swap shortcut -----------------

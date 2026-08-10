@@ -25,7 +25,7 @@ Q96 = Decimal(2) ** 96
 BASE = Decimal("1.0001")
 
 
-def rpc(m, p, tries=6):
+def rpc(m, p, tries=12):
     b = json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p})
     last = None
     for a in range(tries):
@@ -35,11 +35,11 @@ def rpc(m, p, tries=6):
                                           capture_output=True, text=True, check=True).stdout)
             if "error" in r:
                 last = RuntimeError(r["error"])
-                time.sleep(min(20, 3.0 * (a + 1)) if r["error"].get("code") == 429 else 0.4 * (a + 1))
+                time.sleep(min(60, 5.0 * (a + 1)) if r["error"].get("code") == 429 else 0.4 * (a + 1))
                 continue
             return r["result"]
         except Exception as e:
-            last = e; time.sleep(0.5 * (a + 1))
+            last = e; time.sleep(min(60, 5.0 * (a + 1)) if "429" in str(e) else 0.5 * (a + 1))
     raise last
 
 

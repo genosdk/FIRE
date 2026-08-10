@@ -90,7 +90,7 @@ for t, ps in pools_for.items():
         ev = sr.fetch_pool_events(p["pool_id"], int(p["init_block"]), latest)
         cache[p["pool_id"]] = ev
         fetched += 1
-        time.sleep(0.12)
+        time.sleep(0.45)
         if fetched % 50 == 0:
             json.dump(cache, open(EVCACHE, "w"))
             print(f"  fetched {fetched} (cache {len(cache)})")

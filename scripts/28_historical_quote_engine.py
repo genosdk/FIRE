@@ -108,6 +108,10 @@ for t, ps in pools_for.items():
             json.dump(cache, open(EVCACHE, "w"))
             print(f"  fetched {fetched} (cache {len(cache)})")
 json.dump(cache, open(EVCACHE, "w"))
+for _pid, _ev in cache.items():
+    for _e in _ev:
+        if isinstance(_e.get("k"), list):
+            _e["k"] = tuple(_e["k"])
 print(f"event retrieval complete ({len(cache)} pools cached)")
 
 rows, inv_fail, inv_ok = [], 0, 0

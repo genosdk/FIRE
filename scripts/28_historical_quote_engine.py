@@ -27,7 +27,7 @@ CENSUS = "data/analysis/CHAINWIDE_POOL_CENSUS.csv"
 MAIN = "data/analysis/LIFECYCLE_MAIN_POOLS.csv"
 EVCACHE = "data/analysis/_quote_events_cache.json"
 OUT = "data/analysis/HISTORICAL_QUOTE_QUALITY.csv"
-N_TOKENS = 120
+N_TOKENS = 45
 DYN = 8388608
 LICKLET = "0x23192efc86d38f8b9de39af603b73521ec346bcc"
 FIRE = "0x43eea882b845a8493152ebc55cf30ae9281b02d5"
@@ -58,13 +58,26 @@ for t, rs in by_tok.items():
 strata = defaultdict(list)
 for t, b, c, cw in cand:
     strata[(b, c, cw)].append(t)
+
+# how much of each token's pool set is already cached -- the RPC throttles wide
+# eth_getLogs hard, so completing the sample means favouring cheap tokens first
+_pre = json.load(open(EVCACHE)) if os.path.exists(EVCACHE) else {}
+_pools_all = defaultdict(list)
+for _r in csv.DictReader(open(CENSUS)):
+    if _r["fee"] != str(DYN):
+        _pools_all[_r["non_base_token"]].append(_r["pool_id"])
+def _cached_frac(tok):
+    ids = _pools_all.get(tok, [])
+    if not ids: return 0.0
+    return sum(1 for i in ids if i in _pre) / len(ids)
+
 sel = []
 per = max(1, N_TOKENS // max(1, len(strata)))
 for k in sorted(strata):
-    ts = sorted(strata[k], key=lambda x: hashlib.sha256(x.encode()).hexdigest())
+    ts = sorted(strata[k], key=lambda x: (-_cached_frac(x), hashlib.sha256(x.encode()).hexdigest()))
     sel += ts[:per]
 extra = [t for t, *_ in cand if t not in sel]
-extra.sort(key=lambda x: hashlib.sha256(x.encode()).hexdigest())
+extra.sort(key=lambda x: (-_cached_frac(x), hashlib.sha256(x.encode()).hexdigest()))
 sel += extra[:max(0, N_TOKENS - len(sel))]
 for fx in (FIRE, LICKLET):
     if fx in by_tok and fx not in sel:
@@ -90,7 +103,7 @@ for t, ps in pools_for.items():
         ev = sr.fetch_pool_events(p["pool_id"], int(p["init_block"]), latest)
         cache[p["pool_id"]] = ev
         fetched += 1
-        time.sleep(0.45)
+        time.sleep(1.2)
         if fetched % 50 == 0:
             json.dump(cache, open(EVCACHE, "w"))
             print(f"  fetched {fetched} (cache {len(cache)})")

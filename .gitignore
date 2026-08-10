@@ -4,3 +4,6 @@ data/analysis/_*.jsonl
 data/analysis/CHAINWIDE_POOL_CENSUS.csv
 __pycache__/
 *.pyc
+data/analysis/CROSSOVER_FRONTIER.csv
+data/analysis/ORDER_CANDIDATE_SET.csv
+data/analysis/ORDER_CANDIDATE_SET_SUBSET.csv

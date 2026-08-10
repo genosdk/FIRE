@@ -95,6 +95,9 @@ class PoolState:
         self.tick = tick
         self.net = {}          # tick -> liquidityNet
         self.L = 0             # active liquidity
+        self.unfilled = Decimal(0)      # post-fee input the book could not absorb
+        self.unfilled_frac = Decimal(0)
+        self.steps_hit = False          # loop bounded by max_steps, not by the book
 
     def apply_ml(self, lo, hi, dl):
         if dl == 0:
@@ -120,18 +123,33 @@ class PoolState:
         c = [t for t in ts if t > self.tick]
         return min(c) if c else None
 
-    def swap_exact_in(self, zero_for_one, amount_in, fee_pips):
-        """Returns (amount_out, sqrtP_after). Fee is charged on input, as in v4."""
-        rem = Decimal(amount_in) * (Decimal(1_000_000) - Decimal(fee_pips)) / Decimal(1_000_000)
+    def swap_exact_in(self, zero_for_one, amount_in, fee_pips, max_steps=256):
+        """Returns (amount_out, sqrtP_after). Fee is charged on input, as in v4.
+
+        The return signature is unchanged, but the loop now records how it
+        terminated on the instance: `unfilled` / `unfilled_frac` are the post-fee
+        input the book could not absorb, and `steps_hit` says the iteration cap
+        bound the loop rather than the book. Callers that displace price
+        synthetically must check these -- a truncated fill is otherwise
+        indistinguishable from a genuinely uncompetitive quote.
+        """
+        rem0 = Decimal(amount_in) * (Decimal(1_000_000) - Decimal(fee_pips)) / Decimal(1_000_000)
+        rem = rem0
         out = Decimal(0)
         guard = 0
-        while rem > 0 and guard < 256:
+        while rem > 0 and guard < max_steps:
             guard += 1
             L = Decimal(self.L)
             if L <= 0:
                 nt = self.next_tick(zero_for_one)
                 if nt is None:
                     break
+                # price traverses a gap with no liquidity: it moves straight to
+                # the next initialised tick and no tokens change hands. Skipping
+                # this move leaves sqrtP outside the range about to be traded,
+                # which then reports output the book does not hold. Historical
+                # replay never starts in a gap, but synthetic displacement does.
+                self.sqrtP = sqrt_at(nt)
                 self._cross(nt, zero_for_one)
                 continue
             nt = self.next_tick(zero_for_one)
@@ -161,6 +179,9 @@ class PoolState:
                     out += L * (Decimal(1) / a - Decimal(1) / b)
                     self.sqrtP = b
                     rem = Decimal(0)
+        self.unfilled = rem
+        self.unfilled_frac = (rem / rem0) if rem0 > 0 else Decimal(0)
+        self.steps_hit = guard >= max_steps and rem > 0
         return out, self.sqrtP
 
     def _cross(self, tick, zero_for_one):

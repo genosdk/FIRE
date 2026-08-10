@@ -49,7 +49,9 @@ KNOWN_INFRA = {
 }
 
 
-def rpc(m, p, tries=4):
+def rpc(m, p, tries=8):
+    """Retries with a much longer backoff on 429 -- sustained retrieval over
+    thousands of pools trips the node's rate limiter, which is transient."""
     b = json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p})
     last = None
     for a in range(tries):
@@ -58,10 +60,14 @@ def rpc(m, p, tries=4):
                                            "-H", "Content-Type: application/json", "-d", b],
                                           capture_output=True, text=True, check=True).stdout)
             if "error" in r:
-                last = RuntimeError(r["error"]); time.sleep(0.4 * (a + 1)); continue
+                last = RuntimeError(r["error"])
+                time.sleep(min(30, 4.0 * (a + 1)) if r["error"].get("code") == 429
+                           else 0.4 * (a + 1))
+                continue
             return r["result"]
         except Exception as e:
-            last = e; time.sleep(0.4 * (a + 1))
+            last = e
+            time.sleep(min(30, 4.0 * (a + 1)) if "429" in str(e) else 0.4 * (a + 1))
     raise last
 
 
@@ -139,6 +145,7 @@ for tok, rank, ncomp, p in flat:
         d = L["data"][2:]; w = [d[i:i + 64] for i in range(0, len(d), 64)]
         mods.append({"b": int(L["blockNumber"], 16), "dl": s256(w[2]), "salt": int(w[3], 16)})
     cache[pid] = {"swaps": swaps, "mods": mods}
+    time.sleep(0.15)
     if len(cache) % 50 == 0:
         json.dump(cache, open(CACHE, "w"))
         print(f"  {done:,}/{n_pools:,} (cache {len(cache):,})")

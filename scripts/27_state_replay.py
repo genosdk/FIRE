@@ -48,7 +48,10 @@ def logs_adaptive(topics, lo, hi, depth=0):
         return rpc("eth_getLogs", [{"address": PM, "fromBlock": hex(lo), "toBlock": hex(hi),
                                     "topics": topics}], tries=3)
     except Exception as e:
-        if "exceeds limit" not in str(e) or lo >= hi or depth > 12:
+        # the node fails wide queries two ways: a 10,000-log cap and a server-side
+        # timeout. Both are fixed by narrowing the range.
+        msg = str(e)
+        if ("exceeds limit" not in msg and "timed out" not in msg) or lo >= hi or depth > 16:
             raise
         mid = (lo + hi) // 2
         return logs_adaptive(topics, lo, mid, depth + 1) + logs_adaptive(topics, mid + 1, hi, depth + 1)
